@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
+from jose import jwt
 
 from models import TaskRequest, TaskResponse
 from supabase_client import supabase
@@ -41,25 +42,50 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("omni")
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://your-frontend.vercel.app")
+SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
 
 
 # ---------------------------------------------------------------------------
 # Auth dependency
 # ---------------------------------------------------------------------------
 
-async def get_api_key(x_api_key: str = Header(...)):
-    res = supabase.table("api_keys").select("*").eq("key", x_api_key).execute()
+def get_current_user(authorization: str = Header(...)):
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid auth header")
+
+    token = authorization.split(" ")[1]
+
+    try:
+        payload = jwt.decode(
+            token,
+            SUPABASE_JWT_SECRET,
+            algorithms=["HS256"],
+            audience="authenticated"
+        )
+        return payload
+    except Exception:
+        # Fallback: check if it's a legacy API key
+        res = supabase.table("api_keys").select("*").eq("key", token).execute()
+        if res.data:
+            key_info = res.data[0]
+            dev_res = supabase.table("developers").select("*").eq("id", key_info["developer_id"]).execute()
+            if dev_res.data:
+                dev = dev_res.data[0]
+                return {"sub": dev["auth_user_id"], "email": dev["email"], "developer": dev}
+        
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+async def get_developer_from_user(user=Depends(get_current_user)):
+    if "developer" in user:
+        return user["developer"]
+        
+    auth_user_id = user["sub"]
+    res = supabase.table("developers").select("*").eq("auth_user_id", auth_user_id).execute()
     if not res.data:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+        # If user exists in Supabase Auth but not in our developers table, they might need to register
+        raise HTTPException(status_code=404, detail="Developer profile not found. Please sign in to the dashboard.")
     return res.data[0]
-
-
-async def get_developer(api_key_info=Depends(get_api_key)):
-    developer_id = api_key_info["developer_id"]
-    res = supabase.table("developers").select("*").eq("id", developer_id).execute()
-    if not res.data:
-        raise HTTPException(status_code=404, detail="Developer not found")
-    return res.data[0], api_key_info
 
 
 # ---------------------------------------------------------------------------
@@ -67,8 +93,7 @@ async def get_developer(api_key_info=Depends(get_api_key)):
 # ---------------------------------------------------------------------------
 
 @app.post("/ai-task", response_model=TaskResponse)
-async def ai_task(request: TaskRequest, auth=Depends(get_developer)):
-    developer, api_key_info = auth
+async def ai_task(request: TaskRequest, developer=Depends(get_developer_from_user)):
     developer_id        = developer["id"]
     stripe_customer_id  = developer.get("stripe_customer_id")
     task_type           = request.taskType
@@ -149,8 +174,7 @@ async def ai_task(request: TaskRequest, auth=Depends(get_developer)):
 # ---------------------------------------------------------------------------
 
 @app.get("/dashboard/usage")
-async def get_usage(auth=Depends(get_developer)):
-    developer, _ = auth
+async def get_usage(developer=Depends(get_developer_from_user)):
     developer_id       = developer["id"]
     stripe_customer_id = developer.get("stripe_customer_id")
     thirty_days_ago    = (datetime.utcnow() - timedelta(days=30)).isoformat()
@@ -231,11 +255,17 @@ async def get_usage(auth=Depends(get_developer)):
 # ---------------------------------------------------------------------------
 
 @app.post("/auth/login-or-register")
-async def login_or_register(data: dict):
+async def login_or_register(data: dict, user=Depends(get_current_user)):
     email        = data.get("email")
     auth_user_id = data.get("auth_user_id")
+    
     if not email or not auth_user_id:
         raise HTTPException(status_code=400, detail="Email and auth_user_id required")
+    
+    # Security check: ensure the token matches the requested user
+    if auth_user_id != user["sub"]:
+         raise HTTPException(status_code=403, detail="Token does not match requested user")
+
     existing = supabase.table("developers").select("*").eq("auth_user_id", auth_user_id).execute()
     if existing.data:
         developer = existing.data[0]
@@ -245,6 +275,7 @@ async def login_or_register(data: dict):
         api_key = generate_api_key()
         supabase.table("api_keys").insert({"key": api_key, "developer_id": developer["id"], "created_at": datetime.utcnow().isoformat()}).execute()
         return {"apiKey": api_key, "developerId": developer["id"], "new": False}
+    
     existing_email = supabase.table("developers").select("*").eq("email", email).execute()
     if existing_email.data:
         developer = existing_email.data[0]
@@ -262,60 +293,39 @@ async def login_or_register(data: dict):
         api_key = generate_api_key()
         supabase.table("api_keys").insert({"key": api_key, "developer_id": developer["id"], "created_at": datetime.utcnow().isoformat()}).execute()
         return {"apiKey": api_key, "developerId": developer["id"], "new": False}
+    
     developer_id = str(uuid.uuid4())
     stripe_customer_id = None
     try:
         stripe_customer_id = create_stripe_customer(email, developer_id)
     except Exception as e:
         logger.warning(f"Stripe customer creation failed: {e}")
-    supabase.table("developers").insert({"id": developer_id, "email": email, "auth_user_id": auth_user_id, "stripe_customer_id": stripe_customer_id, "created_at": datetime.utcnow().isoformat()}).execute()
+    
+    supabase.table("developers").insert({
+        "id": developer_id, 
+        "email": email, 
+        "auth_user_id": auth_user_id, 
+        "stripe_customer_id": stripe_customer_id, 
+        "created_at": datetime.utcnow().isoformat()
+    }).execute()
+    
     api_key = generate_api_key()
-    supabase.table("api_keys").insert({"key": api_key, "developer_id": developer_id, "created_at": datetime.utcnow().isoformat()}).execute()
+    supabase.table("api_keys").insert({
+        "key": api_key, 
+        "developer_id": developer_id, 
+        "created_at": datetime.utcnow().isoformat()
+    }).execute()
+    
     return {"apiKey": api_key, "developerId": developer_id, "new": True}
 
 
-@app.post("/auth/register")
-async def register(email: str):
-    existing = supabase.table("developers").select("*").eq("email", email).execute()
-    if existing.data:
-        raise HTTPException(status_code=400, detail="Email already registered")
-
-    developer_id = str(uuid.uuid4())
-
-    stripe_customer_id = None
-    try:
-        stripe_customer_id = create_stripe_customer(email, developer_id)
-    except Exception as e:
-        logger.warning(f"Stripe customer creation failed: {e}")
-
-    supabase.table("developers").insert({
-        "id":                 developer_id,
-        "email":              email,
-        "stripe_customer_id": stripe_customer_id,
-        "created_at":         datetime.utcnow().isoformat(),
-    }).execute()
-
-    api_key = generate_api_key()
-    supabase.table("api_keys").insert({
-        "key":          api_key,
-        "developer_id": developer_id,
-        "created_at":   datetime.utcnow().isoformat(),
-    }).execute()
-
-    return {
-        "apiKey":           api_key,
-        "developerId":      developer_id,
-        "stripeCustomerId": stripe_customer_id,
-    }
-
-
 @app.post("/auth/regenerate-key")
-async def regenerate_key(auth=Depends(get_developer)):
-    developer, api_key_info = auth
-    old_key      = api_key_info["key"]
+async def regenerate_key(developer=Depends(get_developer_from_user)):
     developer_id = developer["id"]
 
-    supabase.table("api_keys").delete().eq("key", old_key).execute()
+    # Delete old keys
+    supabase.table("api_keys").delete().eq("developer_id", developer_id).execute()
+    
     new_key = generate_api_key()
     supabase.table("api_keys").insert({
         "key":          new_key,
@@ -326,8 +336,12 @@ async def regenerate_key(auth=Depends(get_developer)):
 
 
 @app.get("/auth/key")
-async def get_key_info(auth=Depends(get_developer)):
-    developer, api_key_info = auth
+async def get_key_info(developer=Depends(get_developer_from_user)):
+    key_res = supabase.table("api_keys").select("*").eq("developer_id", developer["id"]).execute()
+    if not key_res.data:
+        raise HTTPException(status_code=404, detail="API key not found")
+    
+    api_key_info = key_res.data[0]
     return {
         "key":          api_key_info["key"],
         "created_at":   api_key_info["created_at"],
@@ -341,8 +355,7 @@ async def get_key_info(auth=Depends(get_developer)):
 # ---------------------------------------------------------------------------
 
 @app.get("/billing/balance")
-async def get_balance_endpoint(auth=Depends(get_developer)):
-    developer, _ = auth
+async def get_balance_endpoint(developer=Depends(get_developer_from_user)):
     stripe_customer_id = developer.get("stripe_customer_id")
     if not stripe_customer_id:
         try:
@@ -358,8 +371,7 @@ async def get_balance_endpoint(auth=Depends(get_developer)):
 
 
 @app.post("/billing/topup")
-async def topup(amount_usd: float, auth=Depends(get_developer)):
-    developer, _ = auth
+async def topup(amount_usd: float, developer=Depends(get_developer_from_user)):
     stripe_customer_id = developer.get("stripe_customer_id")
     if not stripe_customer_id:
         try:
@@ -377,8 +389,7 @@ async def topup(amount_usd: float, auth=Depends(get_developer)):
 
 
 @app.post("/billing/setup-card")
-async def setup_card(auth=Depends(get_developer)):
-    developer, _ = auth
+async def setup_card(developer=Depends(get_developer_from_user)):
     stripe_customer_id = developer.get("stripe_customer_id")
     if not stripe_customer_id:
         try:
@@ -395,8 +406,7 @@ async def setup_card(auth=Depends(get_developer)):
 
 
 @app.get("/billing/history")
-async def billing_history(auth=Depends(get_developer)):
-    developer, _ = auth
+async def billing_history(developer=Depends(get_developer_from_user)):
     stripe_customer_id = developer.get("stripe_customer_id")
     if not stripe_customer_id:
         return {"transactions": []}
@@ -405,8 +415,7 @@ async def billing_history(auth=Depends(get_developer)):
 
 
 @app.get("/billing/payment-methods")
-async def payment_methods_endpoint(auth=Depends(get_developer)):
-    developer, _ = auth
+async def payment_methods_endpoint(developer=Depends(get_developer_from_user)):
     stripe_customer_id = developer.get("stripe_customer_id")
     if not stripe_customer_id:
         return {"payment_methods": []}
