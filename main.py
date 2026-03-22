@@ -345,7 +345,11 @@ async def get_balance_endpoint(auth=Depends(get_developer)):
     developer, _ = auth
     stripe_customer_id = developer.get("stripe_customer_id")
     if not stripe_customer_id:
-        raise HTTPException(status_code=400, detail="No billing account found.")
+        try:
+            stripe_customer_id = create_stripe_customer(developer["email"], developer["id"])
+            supabase.table("developers").update({"stripe_customer_id": stripe_customer_id}).eq("id", developer["id"]).execute()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not create billing account: {str(e)}")
     balance = get_balance_usd(stripe_customer_id)
     return {
         "balance_usd":                   round(balance, 4),
@@ -358,7 +362,11 @@ async def topup(amount_usd: float, auth=Depends(get_developer)):
     developer, _ = auth
     stripe_customer_id = developer.get("stripe_customer_id")
     if not stripe_customer_id:
-        raise HTTPException(status_code=400, detail="No billing account found.")
+        try:
+            stripe_customer_id = create_stripe_customer(developer["email"], developer["id"])
+            supabase.table("developers").update({"stripe_customer_id": stripe_customer_id}).eq("id", developer["id"]).execute()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not create billing account: {str(e)}")
     checkout_url = create_topup_session(
         stripe_customer_id=stripe_customer_id,
         amount_usd=amount_usd,
@@ -373,7 +381,11 @@ async def setup_card(auth=Depends(get_developer)):
     developer, _ = auth
     stripe_customer_id = developer.get("stripe_customer_id")
     if not stripe_customer_id:
-        raise HTTPException(status_code=400, detail="No billing account found.")
+        try:
+            stripe_customer_id = create_stripe_customer(developer["email"], developer["id"])
+            supabase.table("developers").update({"stripe_customer_id": stripe_customer_id}).eq("id", developer["id"]).execute()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not create billing account: {str(e)}")
     setup_url = create_setup_session(
         stripe_customer_id=stripe_customer_id,
         success_url=f"{FRONTEND_URL}/billing/card-saved",
