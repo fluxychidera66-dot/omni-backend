@@ -248,10 +248,20 @@ async def login_or_register(data: dict):
     existing_email = supabase.table("developers").select("*").eq("email", email).execute()
     if existing_email.data:
         developer = existing_email.data[0]
-        supabase.table("developers").update({"auth_user_id": auth_user_id}).eq("id", developer["id"]).execute()
+        update_data = {"auth_user_id": auth_user_id}
+        if not developer.get("stripe_customer_id"):
+            try:
+                stripe_customer_id = create_stripe_customer(email, developer["id"])
+                update_data["stripe_customer_id"] = stripe_customer_id
+            except Exception as e:
+                logger.warning(f"Stripe customer creation failed: {e}")
+        supabase.table("developers").update(update_data).eq("id", developer["id"]).execute()
         key_res = supabase.table("api_keys").select("*").eq("developer_id", developer["id"]).execute()
         if key_res.data:
             return {"apiKey": key_res.data[0]["key"], "developerId": developer["id"], "new": False}
+        api_key = generate_api_key()
+        supabase.table("api_keys").insert({"key": api_key, "developer_id": developer["id"], "created_at": datetime.utcnow().isoformat()}).execute()
+        return {"apiKey": api_key, "developerId": developer["id"], "new": False}
     developer_id = str(uuid.uuid4())
     stripe_customer_id = None
     try:
