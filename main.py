@@ -230,6 +230,40 @@ async def get_usage(auth=Depends(get_developer)):
 # Auth
 # ---------------------------------------------------------------------------
 
+@app.post("/auth/login-or-register")
+async def login_or_register(data: dict):
+    email        = data.get("email")
+    auth_user_id = data.get("auth_user_id")
+    if not email or not auth_user_id:
+        raise HTTPException(status_code=400, detail="Email and auth_user_id required")
+    existing = supabase.table("developers").select("*").eq("auth_user_id", auth_user_id).execute()
+    if existing.data:
+        developer = existing.data[0]
+        key_res = supabase.table("api_keys").select("*").eq("developer_id", developer["id"]).execute()
+        if key_res.data:
+            return {"apiKey": key_res.data[0]["key"], "developerId": developer["id"], "new": False}
+        api_key = generate_api_key()
+        supabase.table("api_keys").insert({"key": api_key, "developer_id": developer["id"], "created_at": datetime.utcnow().isoformat()}).execute()
+        return {"apiKey": api_key, "developerId": developer["id"], "new": False}
+    existing_email = supabase.table("developers").select("*").eq("email", email).execute()
+    if existing_email.data:
+        developer = existing_email.data[0]
+        supabase.table("developers").update({"auth_user_id": auth_user_id}).eq("id", developer["id"]).execute()
+        key_res = supabase.table("api_keys").select("*").eq("developer_id", developer["id"]).execute()
+        if key_res.data:
+            return {"apiKey": key_res.data[0]["key"], "developerId": developer["id"], "new": False}
+    developer_id = str(uuid.uuid4())
+    stripe_customer_id = None
+    try:
+        stripe_customer_id = create_stripe_customer(email, developer_id)
+    except Exception as e:
+        logger.warning(f"Stripe customer creation failed: {e}")
+    supabase.table("developers").insert({"id": developer_id, "email": email, "auth_user_id": auth_user_id, "stripe_customer_id": stripe_customer_id, "created_at": datetime.utcnow().isoformat()}).execute()
+    api_key = generate_api_key()
+    supabase.table("api_keys").insert({"key": api_key, "developer_id": developer_id, "created_at": datetime.utcnow().isoformat()}).execute()
+    return {"apiKey": api_key, "developerId": developer_id, "new": True}
+
+
 @app.post("/auth/register")
 async def register(email: str):
     existing = supabase.table("developers").select("*").eq("email", email).execute()
